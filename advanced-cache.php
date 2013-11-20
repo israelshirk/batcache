@@ -36,6 +36,14 @@ class batcache {
 
 	var $cancel = false; // Change this to cancel the output buffer. Use batcache_cancel();
 
+	var $ngx_mode = false; // Enable to send responses through nginx.  See nginx's memc module.
+
+	var $ngx_extended_mode = false; // If you're using https://github.com/bpaquet/ngx_http_enhanced_memcached_module
+									// Instead of the default nginx memcached module, this will handle headers for you.
+
+	var $query	=	"";	//	Used to store query data or query string, as it may be.  
+						//	Defaults to an empty string for convenience with implode().
+
 	var $genlock; // Used internally
 	var $do; // Used internally
 
@@ -136,21 +144,24 @@ class batcache {
 			}
 		}
 
+		if ($this->ngx_mode) {
+			unset($cache['output']);
+		}
+
 		wp_cache_set($this->key, $cache, $this->group, $this->max_age + $this->seconds + 30);
 
-		// Unlock regeneration
-		wp_cache_delete("{$this->url_key}_genlock", $this->group);
+		$headers = Array();
 
 		if ( $this->cache_control ) {
-			header( 'Last-Modified: ' . gmdate( 'D, d M Y H:i:s', $cache['time'] ) . ' GMT', true );
-			header("Cache-Control: max-age=$this->max_age, must-revalidate", false);
+			$headers[] = ['Last-Modified: ' . gmdate( 'D, d M Y H:i:s', $cache['time'] ) . ' GMT', true];
+			$headers[] = ["Cache-Control: max-age=$this->max_age, must-revalidate", false];
 		}
 
 		if ( !empty($this->headers) ) foreach ( $this->headers as $k => $v ) {
 			if ( is_array( $v ) )
-				header("{$v[0]}: {$v[1]}", false);
+				$headers[] = ["{$v[0]}: {$v[1]}", false];
 			else
-				header("$k: $v", true);
+				$headers[] = ["$k: $v", true];
 		}
 
 		// Add some debug info just before </head>
@@ -161,6 +172,39 @@ class batcache {
 				$output = substr($output, 0, $tag_position) . $tag . substr($output, $tag_position);
 			}
 		}
+
+		if ( $this->ngx_mode ) {
+			$cleaned_headers = Array();
+
+			foreach ($headers as list($header, $overwrite)) {
+				$header_name = explode(':', $header, 1)[0];
+
+				if (isset($cleaned_headers[$header_name]) && !$overwrite)
+					continue;
+
+				$cleaned_headers[strtolower($header_name)] = $header;
+			}
+
+			$ngx_cache_value = "";
+
+			if ($this->ngx_extended_mode) {
+				$ngx_cache_value = "EXTRACT_HEADERS\r\n";
+				$ngx_cache_value .= implode("\r\n", $cleaned_headers);
+				$ngx_cache_value .= "\r\n\r\n";
+			}
+
+			$ngx_cache_value .= $output;
+
+			wp_cache_set($this->key . '_ngx', $ngx_cache_value, $this->group, $this->max_age + $this->seconds + 30);
+		}
+
+		// I guess this could use array_map, but it doesn't.
+		foreach ($headers as list($header, $overwrite)) {
+			header($header, $overwrite);
+		}
+
+		// Unlock regeneration
+		wp_cache_delete("{$this->url_key}_genlock", $this->group);
 
 		// Pass output to next ob handler
 		return $output;
@@ -256,13 +300,36 @@ if ( $batcache->is_ssl() )
 $batcache->configure_groups();
 
 // Generate the batcache key
-$batcache->key = md5(serialize($batcache->keys));
+if ( !empty($_SERVER['QUERY_STRING']) && strpos($_SERVER['REQUEST_URI']) !== FALSE ) {
+	$batcache->ngx_mode = false;
+}
+
+if ( $batcache->ngx_mode ) {
+	$batcache->key = serialize($batcache->keys);
+} else {
+	// This does require that $batcache->unique values be convertible to strings, but that seems a reasonable limitation to me,
+	// Especially given there are mobile detectors for nginx.
+
+	$batcache->key = $batcache->keys['host'] . '|' . $batcache->keys['method'] . '|' . $batcache->keys['path'] . '|' . join('|', $batcache->unique);
+}
+
+$batcache->key = md5($batcache->key);
 
 // Generate the traffic threshold measurement key
 $batcache->req_key = $batcache->key . '_req';
 
-// Get the batcache
+// Get the batcache if not in nginx mode
 $batcache->cache = wp_cache_get($batcache->key, $batcache->group);
+$batcache->cache = false;
+
+if ($batcache->cache === false) {
+	$batcache->cache = [
+		'output' => '',
+		'time' => 1,
+		'timer' => 0,
+		'version' => 0
+	];
+}
 
 // Are we only caching frequently-requested pages?
 if ( $batcache->seconds < 1 || $batcache->times < 2 ) {
@@ -270,7 +337,11 @@ if ( $batcache->seconds < 1 || $batcache->times < 2 ) {
 } else {
 	// No batcache item found, or ready to sample traffic again at the end of the batcache life?
 	if ( !is_array($batcache->cache) || time() >= $batcache->cache['time'] + $batcache->max_age - $batcache->seconds ) {
-		wp_cache_add($batcache->req_key, 0, $batcache->group);
+		$batcache->requests = wp_cache_get($batcache->req_key, $batcache->group);
+		if ($batcache->requests === false) {
+			wp_cache_add($batcache->req_key, 0, $batcache->group);
+		}
+
 		$batcache->requests = wp_cache_incr($batcache->req_key, 1, $batcache->group);
 
 		if ( $batcache->requests >= $batcache->times )
@@ -283,14 +354,18 @@ if ( $batcache->seconds < 1 || $batcache->times < 2 ) {
 // Recreate the permalink from the URL
 $batcache->permalink = 'http://' . $batcache->keys['host'] . $batcache->keys['path'] . ( isset($batcache->keys['query']['p']) ? "?p=" . $batcache->keys['query']['p'] : '' );
 $batcache->url_key = md5($batcache->permalink);
-$batcache->url_version = (int) wp_cache_get("{$batcache->url_key}_version", $batcache->group);
+$batcache->url_version = (int) wp_cache_get("{$batcache->url_key}_version", $batcache->group) ?: 1;
+
+if ($batcache->url_version === false) {
+	$batcache->url_version = 1;
+}
 
 // If the document has been updated and we are the first to notice, regenerate it.
 if ( $batcache->do !== false && isset($batcache->cache['version']) && $batcache->cache['version'] < $batcache->url_version )
 	$batcache->genlock = wp_cache_add("{$batcache->url_key}_genlock", 1, $batcache->group);
 
 // Did we find a batcached page that hasn't expired?
-if ( isset($batcache->cache['time']) && ! $batcache->genlock && time() < $batcache->cache['time'] + $batcache->max_age ) {
+if ( isset($batcache->cache['time']) && ! $batcache->genlock && time() < $batcache->cache['time'] + $batcache->max_age && !empty($batcache->cache['output']) ) {
 	// Issue redirect if cached and enabled
 	if ( $batcache->cache['redirect_status'] && $batcache->cache['redirect_location'] && $batcache->cache_redirects ) {
 		$status = $batcache->cache['redirect_status'];
